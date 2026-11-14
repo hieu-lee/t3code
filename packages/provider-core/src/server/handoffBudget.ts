@@ -295,14 +295,14 @@ function messageCost(message: OrchestrationV2HistoricalMessage): number {
 }
 
 /**
- * A lower bound on a message's cost before its text is read. `minTextLength` must not exceed
- * the text's `length`; a missing run status only shortens the header.
+ * A lower bound on a message's cost before its text is read. `minTextBytes` must not exceed
+ * the text's serialized size; a missing run status only shortens the header.
  */
 export function minHistoricalMessageCost(
   message: Omit<OrchestrationV2HistoricalMessage, "text" | "runStatus">,
-  minTextLength: number,
+  minTextBytes: number,
 ): number {
-  return messageCostFor(message, minTextLength);
+  return messageCostFor(message, minTextBytes);
 }
 
 export function historyCost(

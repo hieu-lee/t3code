@@ -552,11 +552,11 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
       const candidatesOf = (messages: ReadonlyArray<OrchestrationV2HistoricalMessage>) =>
         messages.map((message) => ({ itemId: message.itemId, minCost: 0 }));
       const pageCandidates = (candidates: ReadonlyArray<HandoffHistoryCandidate>) =>
-        candidates.map(({ minTextLength, ...candidate }) => ({
+        candidates.map(({ minTextBytes, ...candidate }) => ({
           itemId: candidate.itemId,
           minCost: minHistoricalMessageCost(
             { ...candidate, role: candidate.kind === "user_message" ? "user" : "assistant" },
-            minTextLength,
+            minTextBytes,
           ),
         }));
       const select = (
@@ -582,21 +582,22 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
         });
       let candidates = candidatesOf(prefix);
       let loaded = prefix;
+      let sourceItems: ReadonlyArray<{ readonly id: string }> = input.items;
       if (input.readHistory !== undefined) {
         const page = yield* input.readHistory
           .page(HANDOFF_HISTORY_PAGE)
           .pipe(Effect.mapError(readFailed));
         candidates = [...candidates, ...pageCandidates(page.candidates)];
         loaded = [...prefix, ...historical(page.items)];
+        sourceItems = [
+          ...input.items,
+          ...[page.sourceRange.first, page.sourceRange.last].flatMap((id) =>
+            id === undefined ? [] : [{ id }],
+          ),
+        ];
       }
       const order = new Map(candidates.map((candidate, index) => [candidate.itemId, index]));
-      let selected = select(
-        candidates,
-        loaded,
-        input.readHistory === undefined
-          ? input.items
-          : candidates.map((candidate) => ({ id: candidate.itemId })),
-      );
+      let selected = select(candidates, loaded, sourceItems);
       // Oversized items are skipped, so how far back selection reaches depends on their sizes.
       while (selected.missingItemIds !== undefined) {
         // Selection walks newest first, so the newest page of what it might still take comes first.
@@ -613,11 +614,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
         loaded = [...loaded, ...more].toSorted(
           (a, b) => order.get(a.itemId)! - order.get(b.itemId)!,
         );
-        selected = select(
-          candidates,
-          loaded,
-          candidates.map((candidate) => ({ id: candidate.itemId })),
-        );
+        selected = select(candidates, loaded, sourceItems);
       }
       const coverage = selected.coverage;
       return {

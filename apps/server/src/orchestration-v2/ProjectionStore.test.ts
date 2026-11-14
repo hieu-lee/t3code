@@ -3209,7 +3209,7 @@ it.effect(
         ...base(ordinal),
         type: "assistant_message",
         messageId: MessageId.make(`message:handoff-window:${ordinal}`),
-        text: `Answer ${ordinal}`,
+        text: `Answer ${ordinal} é界`,
         streaming: false,
       });
       const items: Array<OrchestrationV2TurnItem> = [
@@ -3238,6 +3238,7 @@ it.effect(
         assistant(5),
         assistant(6),
         assistant(7),
+        { ...base(8), type: "reasoning", text: "Closing thought", streaming: false },
       ];
       for (const item of items) {
         yield* store.apply({
@@ -3260,10 +3261,19 @@ it.effect(
       assert.deepEqual(yield* read(4), { ids: 6, loaded: [1, 4, 5, 6, 7] });
       assert.deepEqual(yield* read(10), { ids: 6, loaded: [1, 2, 4, 5, 6, 7] });
       assert.deepEqual(yield* read(10, []), { ids: 0, loaded: [] });
+      assert.deepEqual(yield* read(10, [runId]), { ids: 6, loaded: [1, 2, 4, 5, 6, 7] });
       const all = yield* store.getHandoffHistory(threadId, undefined, 10);
+      assert.deepEqual(all.sourceRange, {
+        first: TurnItemId.make("item:handoff-window:1"),
+        last: TurnItemId.make("item:handoff-window:8"),
+      });
+      assert.deepEqual((yield* store.getHandoffHistory(threadId, [], 10)).sourceRange, {
+        first: undefined,
+        last: undefined,
+      });
       assert.deepEqual(
-        all.candidates.map((candidate) => candidate.minTextLength),
-        all.items.map((item) => ("text" in item ? item.text.length : undefined)),
+        all.candidates.map((candidate) => candidate.minTextBytes),
+        all.items.map((item) => ("text" in item ? Buffer.byteLength(item.text) : undefined)),
       );
     }).pipe(Effect.provide(layerTest)),
 );

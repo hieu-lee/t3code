@@ -301,3 +301,88 @@ it.effect("inherited history stops at a missing fork ancestor", () =>
     assert.deepEqual(items, []);
   }),
 );
+
+it.effect("paged handoff history matches reading every item, coverage included", () =>
+  Effect.gen(function* () {
+    const service = yield* ContextHandoffService.ContextHandoffServiceV2;
+    // The newest 300 messages are too large to fit, so selection must read past the first page.
+    const historical = Array.from({ length: 700 }, (_, index) =>
+      importedItem({
+        role: index % 2 === 0 ? "user" : "assistant",
+        id: `paged-${String(index).padStart(3, "0")}`,
+        text: `${index} ${"x".repeat(index >= 400 ? 17_000 : 200)}`,
+        ordinal: index + 1,
+      }),
+    );
+    const now = DateTime.makeUnsafe("2026-01-01T00:00:00.000Z");
+    const closing: OrchestrationV2TurnItem = {
+      id: TurnItemId.make("turn-item:paged-closing"),
+      threadId: ThreadId.make("thread:legacy-context"),
+      runId: null,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 701,
+      status: "completed",
+      title: null,
+      startedAt: now,
+      completedAt: now,
+      updatedAt: now,
+      type: "reasoning",
+      text: "Closing thought",
+      streaming: false,
+    };
+    const all = [...historical, closing];
+    const input = {
+      threadId: ThreadId.make("thread:legacy-context"),
+      targetRunId: RunId.make("run:paged"),
+      transferId: ContextTransferId.make("transfer:paged"),
+      fromProviderThreadIds: [],
+      toProviderThreadId: ProviderThreadId.make("provider-thread:paged"),
+      fromProviderInstanceId: ProviderInstanceId.make("codex"),
+      toProviderInstanceId: ProviderInstanceId.make("claudeAgent"),
+      coveredRunOrdinals: { from: 1, to: 1 },
+      strategy: "full_thread_summary" as const,
+      createdAt: DateTime.makeUnsafe("2026-01-02T00:00:00.000Z"),
+    };
+    const loadedItemCount = { value: 0 };
+    const reader: ContextHandoffService.HandoffHistoryReader = {
+      page: (limit) =>
+        Effect.sync(() => {
+          const items = [...historical.slice(-limit), historical[0]!, historical.at(-1)!];
+          loadedItemCount.value += items.length;
+          return {
+            candidates: historical.map((item) => ({
+              itemId: item.id,
+              threadId: item.threadId,
+              runId: item.runId,
+              providerThreadId: item.providerThreadId ?? null,
+              kind: item.type,
+              status: item.status,
+              minTextBytes: "text" in item ? Buffer.byteLength(item.text) : 0,
+            })),
+            sourceRange: { first: all[0]!.id, last: all.at(-1)!.id },
+            items,
+          };
+        }),
+      items: (ids) =>
+        Effect.sync(() => {
+          const wanted = new Set(ids);
+          return historical.filter((item) => wanted.has(item.id));
+        }),
+    };
+    const unpaged = yield* service.prepareProviderHandoff({ ...input, items: all });
+    const paged = yield* service.prepareProviderHandoff({
+      ...input,
+      items: [],
+      readHistory: reader,
+    });
+
+    assert.equal(paged.summaryText, unpaged.summaryText);
+    assert.deepStrictEqual(paged.history, unpaged.history);
+    assert.include(paged.history?.coverage, "turn-item:paged-closing");
+    assert.isBelow(loadedItemCount.value, historical.length);
+  }).pipe(Effect.provide(layerTest)),
+);

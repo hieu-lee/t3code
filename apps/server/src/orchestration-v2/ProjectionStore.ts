@@ -353,7 +353,7 @@ export interface HandoffHistoryCandidate {
   readonly providerThreadId: ProviderThreadId | null;
   readonly kind: OrchestrationV2TurnItem["type"];
   readonly status: OrchestrationV2TurnItem["status"];
-  readonly minTextLength: number;
+  readonly minTextBytes: number;
 }
 
 export interface ProjectionRecordFilter {
@@ -698,6 +698,11 @@ export interface ProjectionStoreV2Shape {
   ) => Effect.Effect<
     {
       readonly candidates: ReadonlyArray<HandoffHistoryCandidate>;
+      /** First and last item of the runs, of any type. */
+      readonly sourceRange: {
+        readonly first: TurnItemId | undefined;
+        readonly last: TurnItemId | undefined;
+      };
       readonly items: ReadonlyArray<OrchestrationV2TurnItem>;
     },
     ProjectionStoreV2Error
@@ -5232,75 +5237,91 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       "ProjectionStore.getHandoffHistory",
     )(
       function* (threadId, runIds, limit) {
-        const where = sql`thread_id = ${threadId}
-          AND type IN ('user_message','assistant_message','command_execution','error',
-            'run_interrupt_result','file_change','proposed_plan')
+        // One snapshot, so an item written meanwhile cannot appear in the bodies but not the candidates.
+        return yield* sql.withTransaction(
+          Effect.gen(function* () {
+            // With a run filter, `+` keeps SQLite off the thread index, which walks the whole thread
+            // when fewer than `limit` items match.
+            const inRuns = sql`${threadColumn(runIds)} = ${threadId}
           AND ${runIds === undefined ? sql`1` : sql`run_id IN (SELECT value FROM json_each(${encodeIdList(runIds)}))`}`;
-        type Row = PayloadRow & { readonly turnItemId: TurnItemId; readonly ordinal: number };
-        // Character counts never exceed a string's UTF-16 length, so these stay lower bounds of
-        // historicalText; 23 and 13 are the fixed command and file-change wrappers.
-        const candidates = yield* sql<HandoffHistoryCandidate>`
+            const where = sql`${inRuns}
+          AND type IN ('user_message','assistant_message','command_execution','error',
+            'run_interrupt_result','file_change','proposed_plan')`;
+            type Row = PayloadRow & { readonly turnItemId: TurnItemId; readonly ordinal: number };
+            // UTF-8 byte counts never exceed the serialized size of historicalText; 23 and 13 are the
+            // fixed command and file-change wrappers.
+            const candidates = yield* sql<HandoffHistoryCandidate>`
           SELECT turn_item_id AS "itemId", thread_id AS "threadId", run_id AS "runId",
             provider_thread_id AS "providerThreadId", type AS "kind", status,
             COALESCE(CASE type
-            WHEN 'command_execution' THEN 23 + length(json_extract(payload_json, '$.input'))
-              + COALESCE(length(json_extract(payload_json, '$.output')), 0)
-            WHEN 'error' THEN length(json_extract(payload_json, '$.failure.message'))
-            WHEN 'run_interrupt_result' THEN length(json_extract(payload_json, '$.message'))
-            WHEN 'proposed_plan' THEN length(json_extract(payload_json, '$.markdown'))
+            WHEN 'command_execution' THEN 23 + length(CAST(json_extract(payload_json, '$.input') AS BLOB))
+              + COALESCE(length(CAST(json_extract(payload_json, '$.output') AS BLOB)), 0)
+            WHEN 'error' THEN length(CAST(json_extract(payload_json, '$.failure.message') AS BLOB))
+            WHEN 'run_interrupt_result' THEN length(CAST(json_extract(payload_json, '$.message') AS BLOB))
+            WHEN 'proposed_plan' THEN length(CAST(json_extract(payload_json, '$.markdown') AS BLOB))
             WHEN 'file_change' THEN 13
-            ELSE length(json_extract(payload_json, '$.text'))
-          END, 0) AS "minTextLength"
+            ELSE length(CAST(json_extract(payload_json, '$.text') AS BLOB))
+          END, 0) AS "minTextBytes"
           FROM orchestration_v2_projection_turn_items
           WHERE ${where}
           ORDER BY ordinal ASC, turn_item_id ASC
         `;
-        const rowsWhere = (
-          kind: "any" | "user" | "other",
-          direction: "first" | "last",
-          count: number,
-        ) => {
-          const filter =
-            kind === "any"
-              ? sql`1`
-              : kind === "user"
-                ? sql`type = 'user_message'`
-                : sql`type <> 'user_message'`;
-          return direction === "first"
-            ? sql<Row>`
+            const rowsWhere = (
+              kind: "any" | "user" | "other",
+              direction: "first" | "last",
+              count: number,
+            ) => {
+              const filter =
+                kind === "any"
+                  ? sql`1`
+                  : kind === "user"
+                    ? sql`type = 'user_message'`
+                    : sql`type <> 'user_message'`;
+              return direction === "first"
+                ? sql<Row>`
                 SELECT payload_json, turn_item_id AS "turnItemId", ordinal
                 FROM orchestration_v2_projection_turn_items
                 WHERE ${where} AND ${filter}
                 ORDER BY ordinal ASC, turn_item_id ASC
                 LIMIT ${count}
               `
-            : sql<Row>`
+                : sql<Row>`
                 SELECT payload_json, turn_item_id AS "turnItemId", ordinal
                 FROM orchestration_v2_projection_turn_items
                 WHERE ${where} AND ${filter}
                 ORDER BY ordinal DESC, turn_item_id DESC
                 LIMIT ${count}
               `;
-        };
-        const rows = new Map<TurnItemId, Row>();
-        for (const batch of [
-          yield* rowsWhere("any", "last", limit),
-          yield* rowsWhere("user", "first", 1),
-          yield* rowsWhere("user", "last", 1),
-          yield* rowsWhere("other", "last", 1),
-        ])
-          for (const row of batch) rows.set(row.turnItemId, row);
-        return {
-          candidates,
-          items: yield* decodeRows(
-            decodeTurnItemPayload,
-            threadId,
-          )(
-            [...rows.values()].toSorted(
-              (a, b) => a.ordinal - b.ordinal || (a.turnItemId < b.turnItemId ? -1 : 1),
-            ),
-          ),
-        };
+            };
+            // The handoff's coverage line names the first and last item of every type, as before.
+            const [firstItem] = yield* sql<{ readonly itemId: TurnItemId }>`
+          SELECT turn_item_id AS "itemId" FROM orchestration_v2_projection_turn_items
+          WHERE ${inRuns} ORDER BY ordinal ASC, turn_item_id ASC LIMIT 1`;
+            const [lastItem] = yield* sql<{ readonly itemId: TurnItemId }>`
+          SELECT turn_item_id AS "itemId" FROM orchestration_v2_projection_turn_items
+          WHERE ${inRuns} ORDER BY ordinal DESC, turn_item_id DESC LIMIT 1`;
+            const rows = new Map<TurnItemId, Row>();
+            for (const batch of [
+              yield* rowsWhere("any", "last", limit),
+              yield* rowsWhere("user", "first", 1),
+              yield* rowsWhere("user", "last", 1),
+              yield* rowsWhere("other", "last", 1),
+            ])
+              for (const row of batch) rows.set(row.turnItemId, row);
+            return {
+              candidates,
+              sourceRange: { first: firstItem?.itemId, last: lastItem?.itemId },
+              items: yield* decodeRows(
+                decodeTurnItemPayload,
+                threadId,
+              )(
+                [...rows.values()].toSorted(
+                  (a, b) => a.ordinal - b.ordinal || (a.turnItemId < b.turnItemId ? -1 : 1),
+                ),
+              ),
+            };
+          }),
+        );
       },
       (effect, threadId, _runIds, _limit) =>
         effect.pipe(Effect.mapError((cause) => new ProjectionStoreReadError({ threadId, cause }))),
@@ -8056,6 +8077,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 INDEXED BY orchestration_v2_projection_turn_items_queued_input_idx
               WHERE held.run_id = per_run.run_key
                 AND held.type = 'user_message'
+                AND json_valid(held.payload_json)
                 AND json_extract(held.payload_json, '$.inputIntent') = 'queued_turn'
             )
             ELSE 0
@@ -8075,6 +8097,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 INDEXED BY orchestration_v2_projection_turn_items_queued_input_idx
                 WHERE held.run_id = counts.run_key
                   AND held.type = 'user_message'
+                  AND json_valid(held.payload_json)
                   AND json_extract(held.payload_json, '$.inputIntent') = 'queued_turn'
               )
               ELSE 0
