@@ -282,8 +282,16 @@ function messageCostFor(
   return Math.max(rendered + RESPONSE_ENVELOPE_BYTES[message.role] + 1, rendered + 4);
 }
 
+// Paged selection restarts over the same message objects, so rejected bodies are sized once.
+const messageCosts = new WeakMap<OrchestrationV2HistoricalMessage, number>();
+
 function messageCost(message: OrchestrationV2HistoricalMessage): number {
-  return messageCostFor(message, jsonEscapedByteLength(message.text));
+  let cost = messageCosts.get(message);
+  if (cost === undefined) {
+    cost = messageCostFor(message, jsonEscapedByteLength(message.text));
+    messageCosts.set(message, cost);
+  }
+  return cost;
 }
 
 /**
